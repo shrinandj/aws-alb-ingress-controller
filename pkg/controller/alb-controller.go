@@ -430,7 +430,17 @@ func (ac *albController) GetNodes() util.AWSStringSlice {
 				continue
 			}
 		}
-		result = append(result, aws.String(n.Spec.ExternalID))
+
+        providerID := n.Spec.ProviderID
+        if providerID == "" {
+		    fmt.Printf("No providerID found for node %s", n.ObjectMeta.Name)
+            continue
+    	}
+
+	    p := strings.Split(providerID, "/")
+        instanceID := p[len(p)-1]
+
+		result = append(result, &instanceID)
 	}
 	sort.Sort(result)
 	return result
