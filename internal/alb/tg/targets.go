@@ -60,6 +60,46 @@ type targetsController struct {
 	endpointResolver backend.EndpointResolver
 }
 
+func (c *targetsController) processAbsentTargets(ctx context.Context, errStr string, additions []*elbv2.TargetDescription, t *Targets) error {
+	// HACK: Sometimes, Kubernetes does not delete terminated node objects quickly enough. If a new node comes
+	// up with the same nodeName but a different instanceID, AWS rejects the calls to register the nodes in the
+	// target group. The "fix" here is to identify such a case and fixing it by:
+	// 1. parsing the returned error to identify the instace id.
+	// 2. creating a new TargetInput without instance id and trying to register them.
+	var prefix, absentID string
+	_, err := fmt.Sscanf(errStr, "%s The following instances do not exist: %s", &prefix, &absentID)
+	if err != nil {
+		albctx.GetLogger(ctx).Errorf("Error finding absent targets for %v: %v", t.TgArn, err)
+		return err
+	}
+
+	absentID = strings.Trim(absentID, "'")
+	albctx.GetLogger(ctx).Infof("Identified absentID %v", absentID)
+	var newAdd []*elbv2.TargetDescription
+	for _, a := range additions {
+		if *a.Id != absentID {
+			newAdd = append(newAdd, a)
+		}
+	}
+
+	if len(newAdd) == 0 {
+		albctx.GetLogger(ctx).Infof("No instance ids other than absent instanceIDs. Returning ...")
+		return nil
+	}
+
+	in := &elbv2.RegisterTargetsInput{
+		TargetGroupArn: aws.String(t.TgArn),
+		Targets:        newAdd,
+	}
+	if _, err := c.cloud.RegisterTargetsWithContext(ctx, in); err != nil {
+		albctx.GetLogger(ctx).Errorf("Error re-adding targets to %v: %v", t.TgArn, err.Error())
+	} else {
+		albctx.GetLogger(ctx).Infof("Successfully added targets to %v. Skipped %v", t.TgArn, absentID)
+	}
+
+	return err
+}
+
 func (c *targetsController) Reconcile(ctx context.Context, t *Targets) error {
 	desired, err := c.endpointResolver.Resolve(t.Ingress, t.Backend, t.TargetType)
 	if err != nil {
@@ -84,11 +124,19 @@ func (c *targetsController) Reconcile(ctx context.Context, t *Targets) error {
 		}
 
 		if _, err := c.cloud.RegisterTargetsWithContext(ctx, in); err != nil {
-			albctx.GetLogger(ctx).Errorf("Error adding targets to %v: %v", t.TgArn, err.Error())
-			albctx.GetEventf(ctx)(api.EventTypeWarning, "ERROR", "Error adding targets to target group %s: %s", t.TgArn, err.Error())
+			errStr := err.Error()
+			albctx.GetLogger(ctx).Errorf("Error adding targets to %v: %v", t.TgArn, errStr)
+			albctx.GetEventf(ctx)(api.EventTypeWarning, "ERROR", "Error adding targets to target group %s: %s", t.TgArn, errStr)
+
+			if err2 := c.processAbsentTargets(ctx, errStr, additions, t); err2 != nil {
+				albctx.GetLogger(ctx).Errorf("Failed attempting to process absent target IDs %v: %v. Returning original error...", t.TgArn, err2.Error())
+			} else {
+                            // Reset err to nil since processAbsentTargets succeeded.
+                            err = nil
+                        }
 			return err
 		}
-		// TODO add Add events ?
+               // TODO add Add events ?
 	}
 
 	if len(removals) > 0 {
